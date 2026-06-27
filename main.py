@@ -24,7 +24,7 @@ logger = logging.getLogger("vk_bridge")
 def _make_incoming_handler(bot: Bot, gw: VkGateway, owner_id: int):
     """Создать обработчик входящих VK-сообщений, замкнутый на bot/gw."""
 
-    async def handle(message: dict) -> None:
+    async def handle(message: dict, is_edit: bool = False) -> None:
         from_id = message.get("from_id")
         # Обрабатываем только сообщения от пользователей (id > 0).
         if not from_id or from_id <= 0:
@@ -36,7 +36,24 @@ def _make_incoming_handler(bot: Bot, gw: VkGateway, owner_id: int):
             name = await gw.fetch_user_name(from_id)
         await db.upsert_user(from_id, name)
 
-        header = f"👤 {name} (vk.com/id{from_id}): "
+        # Если это ответ — сперва переотправляем сообщение, на которое отвечают,
+        # целиком (с вложениями/стикером), а не текстовой копией.
+        reply = message.get("reply_message")
+        if reply and (reply.get("text") or reply.get("attachments")):
+            reply_clean = dict(reply)
+            reply_clean["text"] = media.clean_reply_text(reply.get("text") or "")
+            try:
+                await media.forward_to_telegram(
+                    bot, owner_id, f"{media.REPLY_MARK} ", reply_clean
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось переотправить сообщение-контекст")
+
+        # Для отредактированного сообщения — пометка вместо обычного значка.
+        if is_edit:
+            header = f"✏️ {name} (vk.com/id{from_id}) изменил(а): "
+        else:
+            header = f"👤 {name} (vk.com/id{from_id}): "
         sent_ids = await media.forward_to_telegram(bot, owner_id, header, message)
 
         # Связываем все отправленные TG-сообщения с собеседником (для reply).

@@ -22,6 +22,48 @@ logger = logging.getLogger(__name__)
 # Telegram Bot API позволяет боту скачивать файлы примерно до 20 МБ.
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 
+# Пометка переотправленного (процитированного) сообщения.
+REPLY_MARK = "↩️"
+
+# Максимальная длина переотправляемого текста, чтобы не раздувать сообщение.
+CONTEXT_MAX_LEN = 400
+
+
+# ---------------------------------------------------------------------------
+# Контекст ответа (общее для обоих направлений)
+#
+# Вместо кавычек сообщение, на которое отвечают, переотправляется отдельным
+# сообщением с пометкой ↩️. При этом убираются:
+#   * шапка отправителя «👤 Имя (vk.com/id1): »;
+#   * сама пометка ↩️ от прошлой переотправки;
+#   * вложенная цитата «...» от старых сообщений,
+# чтобы не плодить вложенные ответы.
+# ---------------------------------------------------------------------------
+
+def _strip_sender_header(text: str) -> str:
+    """Убрать префикс отправителя вида «👤 Имя (vk.com/id1): »."""
+    if text.startswith(("👤", "✏️")):
+        marker = "): "
+        idx = text.find(marker)
+        if idx != -1:
+            return text[idx + len(marker):].strip()
+    return text
+
+
+def clean_reply_text(raw: str) -> str:
+    """Очистить текст для переотправки: без шапки, без ↩️ и без вложенной цитаты."""
+    text = _strip_sender_header((raw or "").strip())
+    if text.startswith(REPLY_MARK):
+        text = text[len(REPLY_MARK):].strip()
+    # Старый формат с кавычками — отрезаем вложенную цитату в начале.
+    if text.startswith("«"):
+        end = text.find("»")
+        if end != -1:
+            text = text[end + 1:].strip()
+    if len(text) > CONTEXT_MAX_LEN:
+        text = text[:CONTEXT_MAX_LEN].rstrip() + "…"
+    return text
+
 
 # ---------------------------------------------------------------------------
 # VK -> Telegram
@@ -169,19 +211,22 @@ def _cleanup(*paths: str) -> None:
 
 
 async def send_tg_message_to_vk(
-    bot: Bot, gw: VkGateway, user_id: int, message: Message
+    bot: Bot, gw: VkGateway, user_id: int, message: Message, prefix: str = ""
 ) -> None:
     """Перевести одно сообщение Telegram в ВК нужному собеседнику.
 
     Поддерживает текст, фото, видео, голос, документы, GIF и стикеры.
+    `prefix` — необязательная приписка в начало (например, пометка о правке).
+    Контекст ответа (переотправка) отправляется отдельным сообщением в tg_handler.
     Ошибки на одном сообщении не должны ронять остальную отправку.
     """
-    caption = message.caption or ""
+    lead = prefix
+    caption = lead + (message.caption or "")
     tmp_paths: list[str] = []
     try:
         # --- чистый текст ---
         if message.text:
-            await gw.send_message(user_id, message=message.text)
+            await gw.send_message(user_id, message=lead + message.text)
             return
 
         # --- фото ---
@@ -225,14 +270,14 @@ async def send_tg_message_to_vk(
         # --- стикер Telegram -> картинка в ВК ---
         if message.sticker:
             if message.sticker.is_animated or message.sticker.is_video:
-                await gw.send_message(user_id, message=message.sticker.emoji or "🙂")
+                await gw.send_message(user_id, message=lead + (message.sticker.emoji or "🙂"))
                 return
             webp = await _download_to_temp(bot, message.sticker.file_id, ".webp")
             tmp_paths.append(webp)
             png = await asyncio.to_thread(_webp_to_png, webp)
             tmp_paths.append(png)
             attachment = await gw.upload_photo(png)
-            await gw.send_message(user_id, message="", attachment=attachment)
+            await gw.send_message(user_id, message=lead, attachment=attachment)
             return
 
         # --- аудиофайл ---

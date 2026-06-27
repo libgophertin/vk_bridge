@@ -23,7 +23,8 @@ from vk_api.exceptions import ApiError
 
 logger = logging.getLogger(__name__)
 
-EventHandler = Callable[[dict], Awaitable[None]]
+# Обработчик получает сам объект сообщения и флаг «это редактирование».
+EventHandler = Callable[[dict, bool], Awaitable[None]]
 
 
 def _random_id() -> int:
@@ -120,12 +121,19 @@ class VkGateway:
                 longpoll = VkBotLongPoll(self._session, group_id=self.group_id)
                 logger.info("Запущен VK Longpoll")
                 for event in longpoll.listen():
-                    if event.type != VkBotEventType.MESSAGE_NEW:
+                    if event.type not in (
+                        VkBotEventType.MESSAGE_NEW,
+                        VkBotEventType.MESSAGE_EDIT,
+                    ):
                         continue
+                    is_edit = event.type == VkBotEventType.MESSAGE_EDIT
                     obj = event.object
-                    # API 5.103+: объект содержит ключ "message"; раньше — сам объект.
+                    # MESSAGE_NEW (API 5.103+): объект содержит ключ "message".
+                    # MESSAGE_EDIT: объект сам и есть сообщение.
                     message = obj.get("message", obj) if hasattr(obj, "get") else obj
-                    future = asyncio.run_coroutine_threadsafe(on_event(dict(message)), loop)
+                    future = asyncio.run_coroutine_threadsafe(
+                        on_event(dict(message), is_edit), loop
+                    )
                     try:
                         future.result()  # пробрасываем исключения в лог
                     except Exception:  # noqa: BLE001

@@ -18,4 +18,10 @@ def test_compose_keyboard_buttons():
     assert tg_handler.BTN_SEND in flat
     assert tg_handler.BTN_CLEAR in flat
     assert tg_handler.BTN_SHOW in flat
+    assert tg_handler.BTN_END in flat
     assert kb.is_persistent is True
+
+
+def test_compose_keyboard_shows_recipient_name():
+    kb = tg_handler._compose_keyboard("Иван Петров")
+    assert "Иван Петров" in kb.input_field_placeholder

@@ -38,6 +38,7 @@ SEND_DELAY = 0.5  # задержка между сообщениями при п
 BTN_SEND = "📨 Отправить всё"
 BTN_CLEAR = "🗑 Очистить"
 BTN_SHOW = "👁 Показать очередь"
+BTN_END = "🔚 Завершить диалог"
 
 # Очередь накопленных сообщений: tg_user_id -> list[Message]
 _queues: dict[int, list[Message]] = {}
@@ -58,16 +59,21 @@ def _recipients_keyboard(users: list[db.VkUser]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _compose_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянная reply-клавиатура — висит снизу, не дублируется под сообщениями."""
+def _compose_keyboard(name: str | None = None) -> ReplyKeyboardMarkup:
+    """Постоянная reply-клавиатура — висит снизу, не дублируется под сообщениями.
+
+    Имя получателя показываем в подсказке поля ввода, чтобы было видно, кому пишешь.
+    """
+    placeholder = f"Пишешь → {name}" if name else "Сообщение для отправки в ВК…"
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_SEND)],
             [KeyboardButton(text=BTN_CLEAR), KeyboardButton(text=BTN_SHOW)],
+            [KeyboardButton(text=BTN_END)],
         ],
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Сообщение для отправки в ВК…",
+        input_field_placeholder=placeholder,
     )
 
 
@@ -84,6 +90,7 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
     router = Router()
     # Реагируем только на владельца — остальных игнорируем.
     router.message.filter(F.from_user.id == owner_id)
+    router.edited_message.filter(F.from_user.id == owner_id)
     router.callback_query.filter(F.from_user.id == owner_id)
 
     # --- команды ----------------------------------------------------------
@@ -138,8 +145,9 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
         await callback.message.answer(
             f"✏️ Режим составления (получатель: {name}). "
             "Отправляй сообщения по одному — они будут накапливаться.\n"
-            "Когда закончишь — нажми «📨 Отправить всё» на клавиатуре снизу.",
-            reply_markup=_compose_keyboard(),
+            "Когда закончишь — нажми «📨 Отправить всё», а чтобы перестать писать "
+            "этому собеседнику — «🔚 Завершить диалог».",
+            reply_markup=_compose_keyboard(name),
         )
         await callback.answer()
 
@@ -155,10 +163,42 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
                 "Выбери собеседника через /write."
             )
             return
+        # Переотправляем в ВК сообщение, на которое отвечаем (для контекста).
+        await _resend_reply_context(message.reply_to_message, vk_user_id)
         await media.send_tg_message_to_vk(bot, gw, vk_user_id, message)
         await db.set_last_recipient(vk_user_id)
         name = await db.get_user_name(vk_user_id) or f"id{vk_user_id}"
         await message.answer(f"✅ Отправлено → {name}")
+
+    async def _resend_reply_context(replied: Message, vk_user_id: int) -> None:
+        """Переотправить в ВК сообщение, на которое отвечают.
+
+        Медиа/стикер пересылаем как есть (стикер -> картинка), текст — очищенным.
+        """
+        if _has_media(replied):
+            await media.send_tg_message_to_vk(
+                bot, gw, vk_user_id, replied, prefix=f"{media.REPLY_MARK} "
+            )
+        else:
+            ctx = media.clean_reply_text(replied.text or replied.caption or "")
+            if ctx:
+                await gw.send_message(vk_user_id, message=f"{media.REPLY_MARK} {ctx}")
+        await asyncio.sleep(0.3)
+
+    # --- редактирование своего ответа в Telegram -> отправка правки в ВК ---
+
+    @router.edited_message(F.reply_to_message)
+    async def on_edit_reply(message: Message, bot: Bot) -> None:
+        vk_user_id = await db.get_vk_user_by_tg_message(message.reply_to_message.message_id)
+        if vk_user_id is None:
+            return
+        await _resend_reply_context(message.reply_to_message, vk_user_id)
+        await media.send_tg_message_to_vk(
+            bot, gw, vk_user_id, message, prefix="✏️ (изменено)\n"
+        )
+        await db.set_last_recipient(vk_user_id)
+        name = await db.get_user_name(vk_user_id) or f"id{vk_user_id}"
+        await message.answer(f"✏️ Изменение отправлено → {name}")
 
     # --- кнопки reply-клавиатуры (обрабатываем раньше накопления) ----------
 
@@ -196,6 +236,18 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
         lines = [f"{i}. {_describe(m)}" for i, m in enumerate(queue, 1)]
         await message.answer("👁 В очереди:\n" + "\n".join(lines))
 
+    @router.message(BridgeStates.ComposingMessages, F.text == BTN_END)
+    async def btn_end(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        name = data.get("vk_user_name", "собеседником")
+        _queues.pop(message.from_user.id, None)
+        await state.clear()
+        await message.answer(
+            f"🔚 Диалог с {name} завершён. Сообщения больше никому не уходят — "
+            "выбери собеседника через /write, когда понадобится.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
     # --- накопление сообщений ---------------------------------------------
 
     @router.message(BridgeStates.ComposingMessages)
@@ -218,6 +270,22 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
 
 
 # --- вспомогательное --------------------------------------------------------
+
+def _has_media(message: Message) -> bool:
+    """Есть ли в сообщении медиа/стикер (а не только текст)."""
+    return any(
+        (
+            message.sticker,
+            message.photo,
+            message.video,
+            message.voice,
+            message.animation,
+            message.document,
+            message.audio,
+            message.video_note,
+        )
+    )
+
 
 def _describe(message: Message) -> str:
     if message.text:
