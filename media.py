@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 
 from aiogram import Bot, html
@@ -21,6 +22,44 @@ logger = logging.getLogger(__name__)
 
 # Экранирование пользовательского текста для HTML-разметки Telegram.
 _esc = html.quote
+
+# Упоминания ВК: [id123|Имя], [club123|Имя], [public123|Имя].
+_MENTION_RE = re.compile(r"\[(id|club|public)(\d+)\|([^\]]+)\]")
+
+
+def render_vk_text(text: str) -> str:
+    """Подготовить текст из ВК к HTML Telegram.
+
+    Упоминания [id123|Имя] превращает в кликабельные ссылки, остальной текст
+    экранирует. Возвращает HTML-безопасную строку.
+    """
+    text = text or ""
+    out: list[str] = []
+    pos = 0
+    for m in _MENTION_RE.finditer(text):
+        out.append(_esc(text[pos:m.start()]))
+        kind, num, name = m.group(1), m.group(2), m.group(3)
+        out.append(html.link(_esc(name), f"https://vk.com/{kind}{num}"))
+        pos = m.end()
+    out.append(_esc(text[pos:]))
+    return "".join(out)
+
+
+def _vk_body(message: dict) -> str:
+    """Собрать HTML-тело входящего: текст + пересланные сообщения (fwd)."""
+    body = render_vk_text(message.get("text", "") or "")
+    fwd = message.get("fwd_messages") or []
+    fwd_lines = []
+    for fm in fwd:
+        ft = render_vk_text((fm.get("text") or "").strip())
+        if not ft and fm.get("attachments"):
+            ft = "[вложение]"
+        if ft:
+            fwd_lines.append(f"⏩ {ft}")
+    if fwd_lines:
+        block = "\n".join(fwd_lines)
+        body = f"{body}\n{block}" if body else block
+    return body
 
 # Telegram Bot API позволяет боту скачивать файлы примерно до 20 МБ.
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
@@ -110,13 +149,13 @@ async def forward_to_telegram(
     экранируется здесь. Возвращает id всех отправленных сообщений, чтобы связать
     их с собеседником в БД (для ответа через reply).
     """
-    text = message.get("text", "") or ""
     attachments = message.get("attachments", []) or []
+    body = _vk_body(message)  # текст + упоминания + пересланные сообщения
     # Порядок как в Telegram: сперва отправитель, под ним — на что отвечает, затем текст.
     if reply_context:
-        caption = f"{header.rstrip()}\n{reply_context}{_esc(text)}".rstrip()
+        caption = f"{header.rstrip()}\n{reply_context}{body}".rstrip()
     else:
-        caption = f"{header}{_esc(text)}".rstrip()
+        caption = f"{header}{body}".rstrip()
     sent_ids: list[int] = []
     caption_used = False
 
@@ -244,12 +283,13 @@ def _cleanup(*paths: str) -> None:
 
 async def send_tg_message_to_vk(
     bot: Bot, gw: VkGateway, user_id: int, message: Message, prefix: str = ""
-) -> None:
+) -> int | None:
     """Перевести одно сообщение Telegram в ВК нужному собеседнику.
 
     Поддерживает текст, фото, видео, голос, документы, GIF и стикеры.
     `prefix` — необязательная приписка в начало (например, пометка о правке).
     Контекст ответа (переотправка) отправляется отдельным сообщением в tg_handler.
+    Возвращает id отправленного VK-сообщения (для отслеживания прочтения) или None.
     Ошибки на одном сообщении не должны ронять остальную отправку.
     """
     lead = prefix
@@ -258,59 +298,53 @@ async def send_tg_message_to_vk(
     try:
         # --- чистый текст ---
         if message.text:
-            await gw.send_message(user_id, message=lead + message.text)
-            return
+            return await gw.send_message(user_id, message=lead + message.text)
 
         # --- фото ---
         if message.photo:
             path = await _download_to_temp(bot, message.photo[-1].file_id, ".jpg")
             tmp_paths.append(path)
             attachment = await gw.upload_photo(path)
-            await gw.send_message(user_id, message=caption, attachment=attachment)
-            return
+            return await gw.send_message(user_id, message=caption, attachment=attachment)
 
         # --- голосовое ---
         if message.voice:
             path = await _download_to_temp(bot, message.voice.file_id, ".ogg")
             tmp_paths.append(path)
             attachment = await gw.upload_voice(user_id, path)
-            await gw.send_message(user_id, message=caption, attachment=attachment)
-            return
+            return await gw.send_message(user_id, message=caption, attachment=attachment)
 
         # --- видео ---
         if message.video:
             if message.video.file_size and message.video.file_size > TG_DOWNLOAD_LIMIT:
-                await gw.send_message(
+                return await gw.send_message(
                     user_id,
                     message=(caption + "\n🎬 Видео слишком большое для пересылки.").strip(),
                 )
-                return
             path = await _download_to_temp(bot, message.video.file_id, ".mp4")
             tmp_paths.append(path)
             attachment = await gw.upload_document(user_id, path, title="video.mp4")
-            await gw.send_message(user_id, message=caption, attachment=attachment)
-            return
+            return await gw.send_message(user_id, message=caption, attachment=attachment)
 
         # --- GIF / анимация ---
         if message.animation:
             path = await _download_to_temp(bot, message.animation.file_id, ".mp4")
             tmp_paths.append(path)
             attachment = await gw.upload_document(user_id, path, title="animation.mp4")
-            await gw.send_message(user_id, message=caption, attachment=attachment)
-            return
+            return await gw.send_message(user_id, message=caption, attachment=attachment)
 
         # --- стикер Telegram -> картинка в ВК ---
         if message.sticker:
             if message.sticker.is_animated or message.sticker.is_video:
-                await gw.send_message(user_id, message=lead + (message.sticker.emoji or "🙂"))
-                return
+                return await gw.send_message(
+                    user_id, message=lead + (message.sticker.emoji or "🙂")
+                )
             webp = await _download_to_temp(bot, message.sticker.file_id, ".webp")
             tmp_paths.append(webp)
             png = await asyncio.to_thread(_webp_to_png, webp)
             tmp_paths.append(png)
             attachment = await gw.upload_photo(png)
-            await gw.send_message(user_id, message=lead, attachment=attachment)
-            return
+            return await gw.send_message(user_id, message=lead, attachment=attachment)
 
         # --- аудиофайл ---
         if message.audio:
@@ -318,8 +352,7 @@ async def send_tg_message_to_vk(
             tmp_paths.append(path)
             title = message.audio.file_name or "audio.mp3"
             attachment = await gw.upload_document(user_id, path, title=title)
-            await gw.send_message(user_id, message=caption, attachment=attachment)
-            return
+            return await gw.send_message(user_id, message=caption, attachment=attachment)
 
         # --- документ / файл ---
         if message.document:
@@ -328,8 +361,7 @@ async def send_tg_message_to_vk(
             tmp_paths.append(path)
             title = message.document.file_name or "file"
             attachment = await gw.upload_document(user_id, path, title=title)
-            await gw.send_message(user_id, message=caption, attachment=attachment)
-            return
+            return await gw.send_message(user_id, message=caption, attachment=attachment)
 
         # --- ничего из перечисленного ---
         logger.warning("Тип сообщения Telegram не поддержан для отправки в ВК")

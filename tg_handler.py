@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 
 from aiogram import Bot, F, Router, html
 from aiogram.filters import Command, CommandStart
@@ -85,9 +86,22 @@ def _start_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_router(gw: VkGateway, owner_id: int) -> Router:
-    """Собрать роутер с привязкой к VK-шлюзу и владельцу бота."""
+def build_router(
+    gw: VkGateway,
+    owner_id: int,
+    on_sent: Callable[[int, int, str], None] | None = None,
+) -> Router:
+    """Собрать роутер с привязкой к VK-шлюзу и владельцу бота.
+
+    on_sent(peer_id, vk_message_id, name) вызывается после отправки в ВК —
+    нужно для отслеживания статуса «прочитано».
+    """
     router = Router()
+
+    def _track_read(peer_id: int, msg_id: int | None, name: str) -> None:
+        if on_sent and msg_id:
+            on_sent(peer_id, msg_id, name)
+
     # Реагируем только на владельца — остальных игнорируем.
     router.message.filter(F.from_user.id == owner_id)
     router.edited_message.filter(F.from_user.id == owner_id)
@@ -177,13 +191,16 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
             return
         await gw.set_typing(vk_user_id)
         # Контекст ответа: текст вшиваем в то же сообщение, медиа — отдельным.
-        reply_prefix = await _reply_prefix(message.reply_to_message, vk_user_id)
-        await media.send_tg_message_to_vk(bot, gw, vk_user_id, message, prefix=reply_prefix)
+        reply_prefix = await _reply_prefix(message.reply_to_message, vk_user_id, bot)
+        mid = await media.send_tg_message_to_vk(
+            bot, gw, vk_user_id, message, prefix=reply_prefix
+        )
         await db.set_last_recipient(vk_user_id)
         name = await db.get_user_name(vk_user_id) or f"id{vk_user_id}"
+        _track_read(vk_user_id, mid, name)
         await message.answer(f"✅ Отправлено → {html.quote(name)}")
 
-    async def _reply_prefix(replied: Message, vk_user_id: int) -> str:
+    async def _reply_prefix(replied: Message, vk_user_id: int, bot: Bot) -> str:
         """Подготовить контекст ответа для отправки в ВК.
 
         Медиа/стикер уходит отдельным сообщением (в одно с текстом не слить),
@@ -206,11 +223,12 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
         if vk_user_id is None:
             return
         reply_prefix = await _reply_prefix(message.reply_to_message, vk_user_id)
-        await media.send_tg_message_to_vk(
+        mid = await media.send_tg_message_to_vk(
             bot, gw, vk_user_id, message, prefix=f"✏️ (изменено)\n{reply_prefix}"
         )
         await db.set_last_recipient(vk_user_id)
         name = await db.get_user_name(vk_user_id) or f"id{vk_user_id}"
+        _track_read(vk_user_id, mid, name)
         await message.answer(f"✏️ Изменение отправлено → {html.quote(name)}")
 
     # --- кнопки reply-клавиатуры (обрабатываем раньше накопления) ----------
@@ -227,13 +245,16 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
         await message.answer("📤 Отправляю…")
 
         count = 0
+        last_mid: int | None = None
         for m in queue:
             await gw.set_typing(vk_user_id)
-            await media.send_tg_message_to_vk(bot, gw, vk_user_id, m)
+            mid = await media.send_tg_message_to_vk(bot, gw, vk_user_id, m)
+            last_mid = mid or last_mid
             count += 1
             await asyncio.sleep(SEND_DELAY)
 
         _queues[message.from_user.id] = []
+        _track_read(vk_user_id, last_mid, name)
         await message.answer(f"✅ Отправлено {count} {_plural(count)} → {html.quote(name)}")
 
     @router.message(BridgeStates.ComposingMessages, F.text == BTN_CLEAR)

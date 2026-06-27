@@ -78,16 +78,44 @@ class VkGateway:
 
     # --- отправка -------------------------------------------------------------
 
-    def _send_sync(self, user_id: int, message: str = "", attachment: str = "") -> None:
-        self._api.messages.send(
+    def _send_sync(self, user_id: int, message: str = "", attachment: str = "") -> int:
+        return self._api.messages.send(
             user_id=user_id,
             random_id=_random_id(),
             message=message or "",
             attachment=attachment or "",
         )
 
-    async def send_message(self, user_id: int, message: str = "", attachment: str = "") -> None:
-        await asyncio.to_thread(self._send_sync, user_id, message, attachment)
+    async def send_message(
+        self, user_id: int, message: str = "", attachment: str = ""
+    ) -> int | None:
+        """Отправить сообщение, вернуть его id (для отслеживания прочтения)."""
+        return await asyncio.to_thread(self._send_sync, user_id, message, attachment)
+
+    # --- статусы прочтения ----------------------------------------------------
+
+    def _mark_read_sync(self, user_id: int) -> None:
+        self._api.messages.markAsRead(peer_id=user_id, group_id=self.group_id)
+
+    async def mark_as_read(self, user_id: int) -> None:
+        """Отметить переписку с пользователем как прочитанную сообществом."""
+        try:
+            await asyncio.to_thread(self._mark_read_sync, user_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("Не удалось отметить прочитанным диалог с %s", user_id)
+
+    def _get_out_read_sync(self, user_id: int) -> int:
+        res = self._api.messages.getConversationsById(
+            peer_ids=user_id, group_id=self.group_id
+        )
+        items = res.get("items") or []
+        if items:
+            return int(items[0].get("out_read") or 0)
+        return 0
+
+    async def get_out_read(self, user_id: int) -> int:
+        """Id последнего исходящего сообщения, прочитанного собеседником."""
+        return await asyncio.to_thread(self._get_out_read_sync, user_id)
 
     def _upload_photo_sync(self, path: str) -> str:
         photos = self._upload.photo_messages(path)

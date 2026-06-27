@@ -57,6 +57,32 @@ def test_clean_reply_text_truncates():
     assert len(out) <= media.CONTEXT_MAX_LEN + 1
 
 
+def test_render_vk_text_mention():
+    out = media.render_vk_text("Ку [id167432|Имя Фамилия]")
+    assert '<a href="https://vk.com/id167432">Имя Фамилия</a>' in out
+    assert "Ку " in out
+
+
+def test_render_vk_text_escapes():
+    assert media.render_vk_text("a <b> & c") == "a &lt;b&gt; &amp; c"
+
+
+def test_render_vk_text_club_mention():
+    out = media.render_vk_text("[club42|Сообщество]")
+    assert '<a href="https://vk.com/club42">Сообщество</a>' == out
+
+
+def test_vk_body_forwarded_message():
+    # пересланное сообщение без собственного текста больше не пустое
+    msg = {"text": "", "fwd_messages": [{"text": "текст изнутри"}]}
+    assert media._vk_body(msg) == "⏩ текст изнутри"
+
+
+def test_vk_body_text_and_forward():
+    msg = {"text": "смотри", "fwd_messages": [{"text": "пересланное"}]}
+    assert media._vk_body(msg) == "смотри\n⏩ пересланное"
+
+
 def test_webp_to_png_conversion(tmp_path):
     src = tmp_path / "sticker.webp"
     Image.new("RGBA", (100, 100), (255, 0, 0, 255)).save(src, "WEBP")

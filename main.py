@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from aiogram import Bot, Dispatcher, html
 from aiogram.client.default import DefaultBotProperties
@@ -21,6 +22,49 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("vk_bridge")
+
+
+class ReadWatcher:
+    """Отслеживает прочтение исходящих сообщений и уведомляет владельца.
+
+    В ВК нет события «прочитано», поэтому периодически опрашиваем out_read
+    (id последнего прочитанного собеседником исходящего сообщения).
+    """
+
+    POLL_INTERVAL = 4      # как часто опрашивать ВК, сек
+    TIMEOUT = 15 * 60      # сколько ждать прочтения, прежде чем бросить, сек
+
+    def __init__(self, gw: VkGateway, bot: Bot, owner_id: int) -> None:
+        self._gw = gw
+        self._bot = bot
+        self._owner_id = owner_id
+        # peer_id -> {"msg_id", "name", "ts"}
+        self._pending: dict[int, dict] = {}
+
+    def track(self, peer_id: int, msg_id: int, name: str) -> None:
+        """Начать ждать прочтения сообщения msg_id собеседником peer_id."""
+        self._pending[peer_id] = {"msg_id": msg_id, "name": name, "ts": time.monotonic()}
+
+    async def run(self) -> None:
+        while True:
+            await asyncio.sleep(self.POLL_INTERVAL)
+            for peer_id, info in list(self._pending.items()):
+                if time.monotonic() - info["ts"] > self.TIMEOUT:
+                    self._pending.pop(peer_id, None)
+                    continue
+                try:
+                    out_read = await self._gw.get_out_read(peer_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug("Не удалось проверить прочтение для %s", peer_id)
+                    continue
+                if out_read and out_read >= info["msg_id"]:
+                    self._pending.pop(peer_id, None)
+                    try:
+                        await self._bot.send_message(
+                            self._owner_id, f"👁 Прочитано → {html.quote(info['name'])}"
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug("Не удалось отправить статус «прочитано»")
 
 
 def _make_incoming_handler(bot: Bot, gw: VkGateway, owner_id: int):
@@ -70,6 +114,8 @@ def _make_incoming_handler(bot: Bot, gw: VkGateway, owner_id: int):
         for mid in sent_ids:
             await db.save_message_link(mid, from_id)
         await db.set_last_recipient(from_id)
+        # Отмечаем входящее прочитанным — собеседник в ВК видит галочку.
+        await gw.mark_as_read(from_id)
         logger.info("Переслано сообщение от %s (%s) в Telegram", name, from_id)
 
     return handle
@@ -88,7 +134,8 @@ async def main() -> None:
     gw = VkGateway(settings.vk_token)
     await gw.setup()
 
-    dp.include_router(build_router(gw, settings.tg_owner_id))
+    read_watcher = ReadWatcher(gw, bot, settings.tg_owner_id)
+    dp.include_router(build_router(gw, settings.tg_owner_id, on_sent=read_watcher.track))
 
     incoming = _make_incoming_handler(bot, gw, settings.tg_owner_id)
 
@@ -102,6 +149,7 @@ async def main() -> None:
     logger.info("Запуск моста ВКонтакте ↔ Telegram")
     await asyncio.gather(
         gw.run(incoming, on_typing),
+        read_watcher.run(),
         dp.start_polling(bot),
     )
 
