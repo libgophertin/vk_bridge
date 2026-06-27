@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    container_name: vk_bridge_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /data/bridge.db
+    volumes:
+      - bridge_data:/data
+
+volumes:
+  bridge_data:
