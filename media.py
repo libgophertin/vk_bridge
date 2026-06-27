@@ -11,13 +11,16 @@ import logging
 import os
 import tempfile
 
-from aiogram import Bot
+from aiogram import Bot, html
 from aiogram.types import Message, URLInputFile
 from PIL import Image
 
 from vk_listener import VkGateway
 
 logger = logging.getLogger(__name__)
+
+# Экранирование пользовательского текста для HTML-разметки Telegram.
+_esc = html.quote
 
 # Telegram Bot API позволяет боту скачивать файлы примерно до 20 МБ.
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
@@ -41,9 +44,9 @@ CONTEXT_MAX_LEN = 400
 # ---------------------------------------------------------------------------
 
 def _strip_sender_header(text: str) -> str:
-    """Убрать префикс отправителя вида «👤 Имя (vk.com/id1): »."""
+    """Убрать префикс отправителя вида «👤 Имя: » или «👤 Имя (vk.com/id1): »."""
     if text.startswith(("👤", "✏️")):
-        marker = "): "
+        marker = ": "
         idx = text.find(marker)
         if idx != -1:
             return text[idx + len(marker):].strip()
@@ -51,15 +54,36 @@ def _strip_sender_header(text: str) -> str:
 
 
 def clean_reply_text(raw: str) -> str:
-    """Очистить текст для переотправки: без шапки, без ↩️ и без вложенной цитаты."""
-    text = _strip_sender_header((raw or "").strip())
-    if text.startswith(REPLY_MARK):
-        text = text[len(REPLY_MARK):].strip()
-    # Старый формат с кавычками — отрезаем вложенную цитату в начале.
+    """Достать чистый текст сообщения для переотправки.
+
+    Убирает декорации, которые бот добавляет к пересланным сообщениям:
+      * шапку отправителя «👤 Имя: » (как инлайном, так и отдельной строкой);
+      * строки контекста ↩️ ... (чтобы не плодить вложенные ответы);
+      * старую цитату «...» в начале.
+    """
+    text = (raw or "").strip()
+
+    # Старый формат с кавычками «...» в начале.
     if text.startswith("«"):
         end = text.find("»")
         if end != -1:
             text = text[end + 1:].strip()
+
+    lines = text.split("\n")
+
+    # Первая строка может быть шапкой отправителя.
+    if lines and lines[0].startswith(("👤", "✏️")):
+        inline = _strip_sender_header(lines[0])
+        if inline and inline != lines[0]:
+            lines[0] = inline       # «👤 Имя: текст» -> оставляем текст
+        else:
+            lines.pop(0)            # «👤 Имя:» отдельной строкой -> убираем строку
+
+    # Снимаем ведущие строки контекста ↩️ и пустые строки.
+    while lines and (lines[0].startswith(REPLY_MARK) or not lines[0].strip()):
+        lines.pop(0)
+
+    text = "\n".join(lines).strip()
     if len(text) > CONTEXT_MAX_LEN:
         text = text[:CONTEXT_MAX_LEN].rstrip() + "…"
     return text
@@ -78,16 +102,21 @@ def _largest_image_url(images: list[dict]) -> str | None:
 
 
 async def forward_to_telegram(
-    bot: Bot, chat_id: int, header: str, message: dict
+    bot: Bot, chat_id: int, header: str, message: dict, reply_context: str = ""
 ) -> list[int]:
     """Отправить входящее VK-сообщение владельцу в Telegram.
 
-    Возвращает id всех отправленных сообщений, чтобы связать их с собеседником
-    в БД (для ответа через reply).
+    `header` и `reply_context` уже HTML-безопасны; пользовательский текст
+    экранируется здесь. Возвращает id всех отправленных сообщений, чтобы связать
+    их с собеседником в БД (для ответа через reply).
     """
     text = message.get("text", "") or ""
     attachments = message.get("attachments", []) or []
-    caption = f"{header}{text}".rstrip()
+    # Порядок как в Telegram: сперва отправитель, под ним — на что отвечает, затем текст.
+    if reply_context:
+        caption = f"{header.rstrip()}\n{reply_context}{_esc(text)}".rstrip()
+    else:
+        caption = f"{header}{_esc(text)}".rstrip()
     sent_ids: list[int] = []
     caption_used = False
 
@@ -146,7 +175,7 @@ async def forward_to_telegram(
             elif a_type == "video":
                 video = att["video"]
                 link = f"https://vk.com/video{video['owner_id']}_{video['id']}"
-                title = video.get("title", "видео")
+                title = _esc(video.get("title", "видео"))
                 body = f"{await _cap()}\n🎬 {title}: {link}".strip()
                 m = await bot.send_message(chat_id, body)
                 sent_ids.append(m.message_id)
@@ -154,19 +183,22 @@ async def forward_to_telegram(
             elif a_type == "audio":
                 audio = att["audio"]
                 url = audio.get("url")
-                title = f"{audio.get('artist', '')} — {audio.get('title', '')}".strip(" —")
+                raw_title = f"{audio.get('artist', '')} — {audio.get('title', '')}".strip(" —")
                 if url:
+                    # title в send_audio — это метаданные плеера, не HTML.
                     m = await bot.send_audio(
-                        chat_id, URLInputFile(url), caption=await _cap(), title=title
+                        chat_id, URLInputFile(url), caption=await _cap(), title=raw_title[:64]
                     )
                 else:
-                    m = await bot.send_message(chat_id, f"{await _cap()}\n🎵 {title}".strip())
+                    m = await bot.send_message(
+                        chat_id, f"{await _cap()}\n🎵 {_esc(raw_title)}".strip()
+                    )
                 sent_ids.append(m.message_id)
 
             else:
                 # wall, link, market и прочее — отдаём текстом.
                 m = await bot.send_message(
-                    chat_id, f"{await _cap()}\n📎 Вложение типа «{a_type}»".strip()
+                    chat_id, f"{await _cap()}\n📎 Вложение типа «{_esc(a_type)}»".strip()
                 )
                 sent_ids.append(m.message_id)
 

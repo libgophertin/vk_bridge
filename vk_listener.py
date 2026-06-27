@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 # Обработчик получает сам объект сообщения и флаг «это редактирование».
 EventHandler = Callable[[dict, bool], Awaitable[None]]
+# Обработчик статуса «печатает»: получает vk_user_id печатающего.
+TypingHandler = Callable[[int], Awaitable[None]]
 
 
 def _random_id() -> int:
@@ -111,9 +113,27 @@ class VkGateway:
     async def upload_voice(self, user_id: int, path: str) -> str:
         return await asyncio.to_thread(self._upload_voice_sync, user_id, path)
 
+    # --- статус «печатает» ----------------------------------------------------
+
+    def _set_typing_sync(self, user_id: int) -> None:
+        try:
+            self._api.messages.setActivity(
+                user_id=user_id, type="typing", group_id=self.group_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Не удалось выставить статус «печатает» для %s", user_id)
+
+    async def set_typing(self, user_id: int) -> None:
+        await asyncio.to_thread(self._set_typing_sync, user_id)
+
     # --- Longpoll -------------------------------------------------------------
 
-    def _listen_sync(self, on_event: EventHandler, loop: asyncio.AbstractEventLoop) -> None:
+    def _listen_sync(
+        self,
+        on_event: EventHandler,
+        on_typing: TypingHandler | None,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
         while True:
             try:
                 # Создание longpoll тоже внутри цикла: если Bots Long Poll ещё не
@@ -121,6 +141,15 @@ class VkGateway:
                 longpoll = VkBotLongPoll(self._session, group_id=self.group_id)
                 logger.info("Запущен VK Longpoll")
                 for event in longpoll.listen():
+                    # Статус «печатает» из ВК -> прокидываем в Telegram.
+                    if event.type == VkBotEventType.MESSAGE_TYPING_STATE:
+                        if on_typing is None:
+                            continue
+                        typer = event.object.get("from_id")
+                        if typer and typer > 0:
+                            asyncio.run_coroutine_threadsafe(on_typing(typer), loop)
+                        continue
+
                     if event.type not in (
                         VkBotEventType.MESSAGE_NEW,
                         VkBotEventType.MESSAGE_EDIT,
@@ -163,6 +192,8 @@ class VkGateway:
                 logger.exception("Сбой VK Longpoll, переподключение через 5 сек")
                 time.sleep(5)
 
-    async def run(self, on_event: EventHandler) -> None:
+    async def run(
+        self, on_event: EventHandler, on_typing: TypingHandler | None = None
+    ) -> None:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._listen_sync, on_event, loop)
+        await loop.run_in_executor(None, self._listen_sync, on_event, on_typing, loop)

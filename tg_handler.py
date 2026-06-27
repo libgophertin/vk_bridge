@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from aiogram import Bot, F, Router
+from aiogram import Bot, F, Router, html
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -119,6 +119,18 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
     async def cmd_write(message: Message, state: FSMContext) -> None:
         await _show_recipients(message, state)
 
+    @router.message(Command("who"))
+    async def cmd_who(message: Message, state: FSMContext) -> None:
+        if await state.get_state() == BridgeStates.ComposingMessages.state:
+            data = await state.get_data()
+            name = html.quote(data.get("vk_user_name", "—"))
+            queue = _queues.get(message.from_user.id, [])
+            await message.answer(f"✍️ Сейчас пишешь: {name} (в очереди: {len(queue)})")
+        else:
+            await message.answer(
+                "Сейчас ты никому не пишешь. Выбери собеседника через /write."
+            )
+
     # --- выбор собеседника ------------------------------------------------
 
     async def _show_recipients(target: Message, state: FSMContext) -> None:
@@ -143,7 +155,7 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
         await state.update_data(vk_user_id=vk_user_id, vk_user_name=name)
         _queues[callback.from_user.id] = []
         await callback.message.answer(
-            f"✏️ Режим составления (получатель: {name}). "
+            f"✏️ Режим составления (получатель: {html.quote(name)}). "
             "Отправляй сообщения по одному — они будут накапливаться.\n"
             "Когда закончишь — нажми «📨 Отправить всё», а чтобы перестать писать "
             "этому собеседнику — «🔚 Завершить диалог».",
@@ -163,27 +175,28 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
                 "Выбери собеседника через /write."
             )
             return
-        # Переотправляем в ВК сообщение, на которое отвечаем (для контекста).
-        await _resend_reply_context(message.reply_to_message, vk_user_id)
-        await media.send_tg_message_to_vk(bot, gw, vk_user_id, message)
+        await gw.set_typing(vk_user_id)
+        # Контекст ответа: текст вшиваем в то же сообщение, медиа — отдельным.
+        reply_prefix = await _reply_prefix(message.reply_to_message, vk_user_id)
+        await media.send_tg_message_to_vk(bot, gw, vk_user_id, message, prefix=reply_prefix)
         await db.set_last_recipient(vk_user_id)
         name = await db.get_user_name(vk_user_id) or f"id{vk_user_id}"
-        await message.answer(f"✅ Отправлено → {name}")
+        await message.answer(f"✅ Отправлено → {html.quote(name)}")
 
-    async def _resend_reply_context(replied: Message, vk_user_id: int) -> None:
-        """Переотправить в ВК сообщение, на которое отвечают.
+    async def _reply_prefix(replied: Message, vk_user_id: int) -> str:
+        """Подготовить контекст ответа для отправки в ВК.
 
-        Медиа/стикер пересылаем как есть (стикер -> картинка), текст — очищенным.
+        Медиа/стикер уходит отдельным сообщением (в одно с текстом не слить),
+        а текст возвращается приставкой, чтобы попасть в то же сообщение.
         """
         if _has_media(replied):
             await media.send_tg_message_to_vk(
                 bot, gw, vk_user_id, replied, prefix=f"{media.REPLY_MARK} "
             )
-        else:
-            ctx = media.clean_reply_text(replied.text or replied.caption or "")
-            if ctx:
-                await gw.send_message(vk_user_id, message=f"{media.REPLY_MARK} {ctx}")
-        await asyncio.sleep(0.3)
+            await asyncio.sleep(0.3)
+            return ""
+        ctx = media.clean_reply_text(replied.text or replied.caption or "")
+        return f"{media.REPLY_MARK} {ctx}\n\n" if ctx else ""
 
     # --- редактирование своего ответа в Telegram -> отправка правки в ВК ---
 
@@ -192,13 +205,13 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
         vk_user_id = await db.get_vk_user_by_tg_message(message.reply_to_message.message_id)
         if vk_user_id is None:
             return
-        await _resend_reply_context(message.reply_to_message, vk_user_id)
+        reply_prefix = await _reply_prefix(message.reply_to_message, vk_user_id)
         await media.send_tg_message_to_vk(
-            bot, gw, vk_user_id, message, prefix="✏️ (изменено)\n"
+            bot, gw, vk_user_id, message, prefix=f"✏️ (изменено)\n{reply_prefix}"
         )
         await db.set_last_recipient(vk_user_id)
         name = await db.get_user_name(vk_user_id) or f"id{vk_user_id}"
-        await message.answer(f"✏️ Изменение отправлено → {name}")
+        await message.answer(f"✏️ Изменение отправлено → {html.quote(name)}")
 
     # --- кнопки reply-клавиатуры (обрабатываем раньше накопления) ----------
 
@@ -215,12 +228,13 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
 
         count = 0
         for m in queue:
+            await gw.set_typing(vk_user_id)
             await media.send_tg_message_to_vk(bot, gw, vk_user_id, m)
             count += 1
             await asyncio.sleep(SEND_DELAY)
 
         _queues[message.from_user.id] = []
-        await message.answer(f"✅ Отправлено {count} {_plural(count)} → {name}")
+        await message.answer(f"✅ Отправлено {count} {_plural(count)} → {html.quote(name)}")
 
     @router.message(BridgeStates.ComposingMessages, F.text == BTN_CLEAR)
     async def btn_clear(message: Message, state: FSMContext) -> None:
@@ -233,13 +247,13 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
         if not queue:
             await message.answer("Очередь пуста.")
             return
-        lines = [f"{i}. {_describe(m)}" for i, m in enumerate(queue, 1)]
+        lines = [f"{i}. {html.quote(_describe(m))}" for i, m in enumerate(queue, 1)]
         await message.answer("👁 В очереди:\n" + "\n".join(lines))
 
     @router.message(BridgeStates.ComposingMessages, F.text == BTN_END)
     async def btn_end(message: Message, state: FSMContext) -> None:
         data = await state.get_data()
-        name = data.get("vk_user_name", "собеседником")
+        name = html.quote(data.get("vk_user_name", "собеседником"))
         _queues.pop(message.from_user.id, None)
         await state.clear()
         await message.answer(
@@ -254,6 +268,10 @@ def build_router(gw: VkGateway, owner_id: int) -> Router:
     async def on_compose(message: Message, state: FSMContext) -> None:
         queue = _queues.setdefault(message.from_user.id, [])
         queue.append(message)
+        # Пока копишь — собеседник в ВК видит «печатает…».
+        data = await state.get_data()
+        if data.get("vk_user_id"):
+            await gw.set_typing(data["vk_user_id"])
         # Клавиатура уже висит снизу — под каждым сообщением её не повторяем.
         await message.answer(f"➕ Добавлено ({len(queue)} в очереди)")
 
