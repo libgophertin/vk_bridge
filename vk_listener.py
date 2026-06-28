@@ -78,19 +78,33 @@ class VkGateway:
 
     # --- отправка -------------------------------------------------------------
 
-    def _send_sync(self, user_id: int, message: str = "", attachment: str = "") -> int:
-        return self._api.messages.send(
-            user_id=user_id,
-            random_id=_random_id(),
-            message=message or "",
-            attachment=attachment or "",
-        )
+    def _send_sync(
+        self, user_id: int, message: str = "", attachment: str = "", reply_to: int | None = None
+    ) -> int:
+        params = {
+            "user_id": user_id,
+            "random_id": _random_id(),
+            "message": message or "",
+            "attachment": attachment or "",
+        }
+        if reply_to:
+            params["reply_to"] = reply_to
+        return self._api.messages.send(**params)
 
     async def send_message(
-        self, user_id: int, message: str = "", attachment: str = ""
+        self,
+        user_id: int,
+        message: str = "",
+        attachment: str = "",
+        reply_to: int | None = None,
     ) -> int | None:
-        """Отправить сообщение, вернуть его id (для отслеживания прочтения)."""
-        return await asyncio.to_thread(self._send_sync, user_id, message, attachment)
+        """Отправить сообщение, вернуть его id.
+
+        reply_to — id сообщения в ВК, на которое отвечаем (нативный ответ).
+        """
+        return await asyncio.to_thread(
+            self._send_sync, user_id, message, attachment, reply_to
+        )
 
     # --- статусы прочтения ----------------------------------------------------
 

@@ -25,25 +25,31 @@ logger = logging.getLogger("vk_bridge")
 
 
 class ReadWatcher:
-    """Отслеживает прочтение исходящих сообщений и уведомляет владельца.
+    """Отслеживает прочтение исходящих сообщений и выполняет действие при прочтении.
 
     В ВК нет события «прочитано», поэтому периодически опрашиваем out_read
-    (id последнего прочитанного собеседником исходящего сообщения).
+    (id последнего прочитанного собеседником исходящего сообщения). Что делать
+    при прочтении (поменять реакцию / отредактировать сообщение) задаёт вызывающий
+    через колбэк on_read — чтобы не плодить лишние сообщения в чате.
     """
 
     POLL_INTERVAL = 4      # как часто опрашивать ВК, сек
     TIMEOUT = 15 * 60      # сколько ждать прочтения, прежде чем бросить, сек
 
-    def __init__(self, gw: VkGateway, bot: Bot, owner_id: int) -> None:
+    def __init__(self, gw: VkGateway) -> None:
         self._gw = gw
-        self._bot = bot
-        self._owner_id = owner_id
-        # peer_id -> {"msg_id", "name", "ts"}
+        # peer_id -> {"msg_id", "on_read", "ts"}
         self._pending: dict[int, dict] = {}
 
-    def track(self, peer_id: int, msg_id: int, name: str) -> None:
-        """Начать ждать прочтения сообщения msg_id собеседником peer_id."""
-        self._pending[peer_id] = {"msg_id": msg_id, "name": name, "ts": time.monotonic()}
+    def track(self, peer_id: int, msg_id: int | None, on_read) -> None:
+        """Ждать прочтения msg_id собеседником peer_id, затем вызвать on_read()."""
+        if not msg_id:
+            return
+        self._pending[peer_id] = {
+            "msg_id": msg_id,
+            "on_read": on_read,
+            "ts": time.monotonic(),
+        }
 
     async def run(self) -> None:
         while True:
@@ -60,11 +66,9 @@ class ReadWatcher:
                 if out_read and out_read >= info["msg_id"]:
                     self._pending.pop(peer_id, None)
                     try:
-                        await self._bot.send_message(
-                            self._owner_id, f"👁 Прочитано → {html.quote(info['name'])}"
-                        )
+                        await info["on_read"]()
                     except Exception:  # noqa: BLE001
-                        logger.debug("Не удалось отправить статус «прочитано»")
+                        logger.debug("Не удалось выполнить действие при прочтении")
 
 
 def _make_incoming_handler(bot: Bot, gw: VkGateway, owner_id: int):
@@ -82,24 +86,29 @@ def _make_incoming_handler(bot: Bot, gw: VkGateway, owner_id: int):
             name = await gw.fetch_user_name(from_id)
         await db.upsert_user(from_id, name)
 
-        # Контекст ответа: текст встраиваем в то же сообщение (меньше уведомлений),
-        # а медиа/стикер нельзя слить — отправляем отдельным сообщением.
+        # Ответ: по возможности — нативный reply Telegram на ранее пересланное
+        # сообщение. Если связи нет (старое сообщение) — старый способ через ↩️.
         reply_context = ""
+        reply_to_tg = None
         reply = message.get("reply_message")
-        if reply and (reply.get("text") or reply.get("attachments")):
-            if reply.get("attachments"):
-                reply_clean = dict(reply)
-                reply_clean["text"] = media.clean_reply_text(reply.get("text") or "")
-                try:
-                    await media.forward_to_telegram(
-                        bot, owner_id, f"{media.REPLY_MARK} ", reply_clean
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception("Не удалось переотправить сообщение-контекст")
-            else:
-                ctx = media.clean_reply_text(reply.get("text") or "")
-                if ctx:
-                    reply_context = f"{media.REPLY_MARK} {html.quote(ctx)}\n\n"
+        if reply:
+            replied_vk_id = reply.get("id")
+            if replied_vk_id:
+                reply_to_tg = await db.get_tg_by_vk_message(replied_vk_id)
+            if reply_to_tg is None and (reply.get("text") or reply.get("attachments")):
+                if reply.get("attachments"):
+                    reply_clean = dict(reply)
+                    reply_clean["text"] = media.clean_reply_text(reply.get("text") or "")
+                    try:
+                        await media.forward_to_telegram(
+                            bot, owner_id, f"{media.REPLY_MARK} ", reply_clean
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Не удалось переотправить сообщение-контекст")
+                else:
+                    ctx = media.clean_reply_text(reply.get("text") or "")
+                    if ctx:
+                        reply_context = f"{media.REPLY_MARK} {html.quote(ctx)}\n\n"
 
         # Красивое имя: кликабельная жирная ссылка на профиль.
         link = html.link(html.bold(html.quote(name)), f"https://vk.com/id{from_id}")
@@ -107,12 +116,14 @@ def _make_incoming_handler(bot: Bot, gw: VkGateway, owner_id: int):
         mark = "✏️" if is_edit else "👤"
         header = f"{mark} {link}{verb}: "
         sent_ids = await media.forward_to_telegram(
-            bot, owner_id, header, message, reply_context=reply_context
+            bot, owner_id, header, message,
+            reply_context=reply_context, reply_to_message_id=reply_to_tg,
         )
 
-        # Связываем все отправленные TG-сообщения с собеседником (для reply).
+        # Связываем TG-сообщения с собеседником и id сообщения ВК (для нативных reply).
+        vk_msg_id = message.get("id")
         for mid in sent_ids:
-            await db.save_message_link(mid, from_id)
+            await db.save_message_link(mid, from_id, vk_msg_id)
         await db.set_last_recipient(from_id)
         # Отмечаем входящее прочитанным — собеседник в ВК видит галочку.
         await gw.mark_as_read(from_id)
@@ -134,8 +145,8 @@ async def main() -> None:
     gw = VkGateway(settings.vk_token)
     await gw.setup()
 
-    read_watcher = ReadWatcher(gw, bot, settings.tg_owner_id)
-    dp.include_router(build_router(gw, settings.tg_owner_id, on_sent=read_watcher.track))
+    read_watcher = ReadWatcher(gw)
+    dp.include_router(build_router(gw, settings.tg_owner_id, read_watcher=read_watcher))
 
     incoming = _make_incoming_handler(bot, gw, settings.tg_owner_id)
 

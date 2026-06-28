@@ -51,9 +51,18 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS msg_links (
                 tg_message_id INTEGER PRIMARY KEY,
                 vk_user_id    INTEGER NOT NULL,
+                vk_message_id INTEGER,
                 created_at    REAL NOT NULL
             );
             """
+        )
+        # Миграция для старых баз: добавить колонку vk_message_id, если её нет.
+        async with db.execute("PRAGMA table_info(msg_links)") as cur:
+            cols = [row[1] for row in await cur.fetchall()]
+        if "vk_message_id" not in cols:
+            await db.execute("ALTER TABLE msg_links ADD COLUMN vk_message_id INTEGER")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_links_vk ON msg_links(vk_message_id)"
         )
         await db.commit()
     logger.info("База данных инициализирована: %s", _db_path)
@@ -115,16 +124,24 @@ async def get_last_recipient() -> int | None:
             return int(row[0]) if row else None
 
 
-async def save_message_link(tg_message_id: int, vk_user_id: int) -> None:
-    """Запомнить, какому собеседнику в ВК соответствует сообщение в TG."""
+async def save_message_link(
+    tg_message_id: int, vk_user_id: int, vk_message_id: int | None = None
+) -> None:
+    """Связать сообщение TG с собеседником и (опц.) id сообщения в ВК.
+
+    vk_message_id нужен для нативных ответов: по нему находим, какому TG-сообщению
+    соответствует сообщение ВК, и наоборот.
+    """
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(
             """
-            INSERT INTO msg_links (tg_message_id, vk_user_id, created_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(tg_message_id) DO UPDATE SET vk_user_id = excluded.vk_user_id
+            INSERT INTO msg_links (tg_message_id, vk_user_id, vk_message_id, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(tg_message_id) DO UPDATE SET
+                vk_user_id = excluded.vk_user_id,
+                vk_message_id = COALESCE(excluded.vk_message_id, msg_links.vk_message_id)
             """,
-            (tg_message_id, vk_user_id, time.time()),
+            (tg_message_id, vk_user_id, vk_message_id, time.time()),
         )
         await db.commit()
 
@@ -137,3 +154,28 @@ async def get_vk_user_by_tg_message(tg_message_id: int) -> int | None:
         ) as cur:
             row = await cur.fetchone()
             return int(row[0]) if row else None
+
+
+async def get_tg_by_vk_message(vk_message_id: int) -> int | None:
+    """Найти TG-сообщение, соответствующее сообщению ВК (для нативного reply)."""
+    async with aiosqlite.connect(_db_path) as db:
+        async with db.execute(
+            """
+            SELECT tg_message_id FROM msg_links
+            WHERE vk_message_id = ? ORDER BY created_at DESC LIMIT 1
+            """,
+            (vk_message_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else None
+
+
+async def get_vk_message_by_tg(tg_message_id: int) -> int | None:
+    """id сообщения ВК для данного TG-сообщения (чтобы ответить нативно в ВК)."""
+    async with aiosqlite.connect(_db_path) as db:
+        async with db.execute(
+            "SELECT vk_message_id FROM msg_links WHERE tg_message_id = ?",
+            (tg_message_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else None

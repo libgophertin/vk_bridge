@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
 
 from aiogram import Bot, F, Router, html
 from aiogram.filters import Command, CommandStart
@@ -23,6 +22,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    ReactionTypeEmoji,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
@@ -43,6 +43,12 @@ BTN_END = "🔚 Завершить диалог"
 
 # Очередь накопленных сообщений: tg_user_id -> list[Message]
 _queues: dict[int, list[Message]] = {}
+
+# id редактируемого сообщения-счётчика очереди: tg_user_id -> tg_message_id
+_status_msgs: dict[int, int] = {}
+
+# Служебные сообщения бота шлём без звука, чтобы не путать с реальной перепиской.
+SILENT = {"disable_notification": True}
 
 
 class BridgeStates(StatesGroup):
@@ -86,21 +92,56 @@ def _start_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_router(
-    gw: VkGateway,
-    owner_id: int,
-    on_sent: Callable[[int, int, str], None] | None = None,
-) -> Router:
+def build_router(gw: VkGateway, owner_id: int, read_watcher=None) -> Router:
     """Собрать роутер с привязкой к VK-шлюзу и владельцу бота.
 
-    on_sent(peer_id, vk_message_id, name) вызывается после отправки в ВК —
-    нужно для отслеживания статуса «прочитано».
+    read_watcher (опц.) с методом track(peer_id, vk_message_id, on_read) —
+    для статуса «прочитано» без засорения чата (реакцией/редактированием).
     """
     router = Router()
 
-    def _track_read(peer_id: int, msg_id: int | None, name: str) -> None:
-        if on_sent and msg_id:
-            on_sent(peer_id, msg_id, name)
+    async def _confirm(bot: Bot, owner_msg: Message, vk_user_id: int,
+                       mid: int | None, name: str) -> None:
+        """Подтвердить отправку без лишних сообщений.
+
+        Сначала пытаемся поставить реакцию ✍️ на сообщение владельца; при прочтении
+        меняем на 👀. Если реакции боту недоступны — одно тихое сообщение, которое
+        редактируется в «Прочитано».
+        """
+        chat_id, msg_id_tg = owner_msg.chat.id, owner_msg.message_id
+        reacted = False
+        try:
+            await bot.set_message_reaction(
+                chat_id, msg_id_tg, reaction=[ReactionTypeEmoji(emoji="✍")]
+            )
+            reacted = True
+        except Exception:  # noqa: BLE001
+            logger.debug("Реакция недоступна, откат на текстовое подтверждение")
+
+        if reacted:
+            async def on_read() -> None:
+                try:
+                    await bot.set_message_reaction(
+                        chat_id, msg_id_tg, reaction=[ReactionTypeEmoji(emoji="👀")]
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Не удалось обновить реакцию на «прочитано»")
+        else:
+            conf = await bot.send_message(
+                chat_id, f"✅ → {html.quote(name)}", **SILENT
+            )
+
+            async def on_read() -> None:
+                try:
+                    await bot.edit_message_text(
+                        f"👁 Прочитано → {html.quote(name)}",
+                        chat_id=chat_id, message_id=conf.message_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Не удалось отредактировать подтверждение")
+
+        if read_watcher and mid:
+            read_watcher.track(vk_user_id, mid, on_read)
 
     # Реагируем только на владельца — остальных игнорируем.
     router.message.filter(F.from_user.id == owner_id)
@@ -123,10 +164,12 @@ def build_router(
     @router.message(Command("cancel"))
     async def cmd_cancel(message: Message, state: FSMContext) -> None:
         _queues.pop(message.from_user.id, None)
+        _status_msgs.pop(message.from_user.id, None)
         await state.clear()
         await message.answer(
             "❌ Отменено. Вышли из текущего режима.",
             reply_markup=ReplyKeyboardRemove(),
+            **SILENT,
         )
 
     @router.message(Command("write"))
@@ -168,12 +211,14 @@ def build_router(
         await state.set_state(BridgeStates.ComposingMessages)
         await state.update_data(vk_user_id=vk_user_id, vk_user_name=name)
         _queues[callback.from_user.id] = []
+        _status_msgs.pop(callback.from_user.id, None)
         await callback.message.answer(
             f"✏️ Режим составления (получатель: {html.quote(name)}). "
             "Отправляй сообщения по одному — они будут накапливаться.\n"
             "Когда закончишь — нажми «📨 Отправить всё», а чтобы перестать писать "
             "этому собеседнику — «🔚 Завершить диалог».",
             reply_markup=_compose_keyboard(name),
+            **SILENT,
         )
         await callback.answer()
 
@@ -190,18 +235,24 @@ def build_router(
             )
             return
         await gw.set_typing(vk_user_id)
-        # Контекст ответа: текст вшиваем в то же сообщение, медиа — отдельным.
-        reply_prefix = await _reply_prefix(message.reply_to_message, vk_user_id, bot)
+        # Нативный ответ: если знаем id сообщения ВК — отвечаем на него штатно.
+        vk_reply_to = await db.get_vk_message_by_tg(replied_id)
+        prefix = "" if vk_reply_to else await _reply_prefix(message.reply_to_message, vk_user_id, bot)
         mid = await media.send_tg_message_to_vk(
-            bot, gw, vk_user_id, message, prefix=reply_prefix
+            bot, gw, vk_user_id, message, prefix=prefix, reply_to=vk_reply_to
         )
+        # Если reply_to не принят (устарел) — отправляем без него, чтобы не потерять.
+        if mid is None and vk_reply_to:
+            mid = await media.send_tg_message_to_vk(bot, gw, vk_user_id, message, prefix=prefix)
         await db.set_last_recipient(vk_user_id)
+        # Запоминаем своё сообщение, чтобы reply собеседника на него тоже связался.
+        if mid:
+            await db.save_message_link(message.message_id, vk_user_id, mid)
         name = await db.get_user_name(vk_user_id) or f"id{vk_user_id}"
-        _track_read(vk_user_id, mid, name)
-        await message.answer(f"✅ Отправлено → {html.quote(name)}")
+        await _confirm(bot, message, vk_user_id, mid, name)
 
     async def _reply_prefix(replied: Message, vk_user_id: int, bot: Bot) -> str:
-        """Подготовить контекст ответа для отправки в ВК.
+        """Запасной контекст ответа, когда нет нативной связи с сообщением ВК.
 
         Медиа/стикер уходит отдельным сообщением (в одно с текстом не слить),
         а текст возвращается приставкой, чтобы попасть в то же сообщение.
@@ -219,82 +270,114 @@ def build_router(
 
     @router.edited_message(F.reply_to_message)
     async def on_edit_reply(message: Message, bot: Bot) -> None:
-        vk_user_id = await db.get_vk_user_by_tg_message(message.reply_to_message.message_id)
+        replied_id = message.reply_to_message.message_id
+        vk_user_id = await db.get_vk_user_by_tg_message(replied_id)
         if vk_user_id is None:
             return
-        reply_prefix = await _reply_prefix(message.reply_to_message, vk_user_id)
+        vk_reply_to = await db.get_vk_message_by_tg(replied_id)
+        prefix = "" if vk_reply_to else await _reply_prefix(message.reply_to_message, vk_user_id, bot)
         mid = await media.send_tg_message_to_vk(
-            bot, gw, vk_user_id, message, prefix=f"✏️ (изменено)\n{reply_prefix}"
+            bot, gw, vk_user_id, message, prefix=f"✏️ (изменено)\n{prefix}", reply_to=vk_reply_to
         )
         await db.set_last_recipient(vk_user_id)
+        if mid:
+            await db.save_message_link(message.message_id, vk_user_id, mid)
         name = await db.get_user_name(vk_user_id) or f"id{vk_user_id}"
-        _track_read(vk_user_id, mid, name)
-        await message.answer(f"✏️ Изменение отправлено → {html.quote(name)}")
+        await _confirm(bot, message, vk_user_id, mid, name)
 
     # --- кнопки reply-клавиатуры (обрабатываем раньше накопления) ----------
 
     @router.message(BridgeStates.ComposingMessages, F.text == BTN_SEND)
     async def btn_send(message: Message, state: FSMContext, bot: Bot) -> None:
-        queue = _queues.get(message.from_user.id, [])
+        uid = message.from_user.id
+        queue = _queues.get(uid, [])
         if not queue:
-            await message.answer("Очередь пуста — нечего отправлять.")
+            await message.answer("Очередь пуста — нечего отправлять.", **SILENT)
             return
         data = await state.get_data()
         vk_user_id = data.get("vk_user_id")
         name = data.get("vk_user_name", f"id{vk_user_id}")
-        await message.answer("📤 Отправляю…")
 
         count = 0
         last_mid: int | None = None
         for m in queue:
             await gw.set_typing(vk_user_id)
             mid = await media.send_tg_message_to_vk(bot, gw, vk_user_id, m)
-            last_mid = mid or last_mid
+            if mid:
+                last_mid = mid
+                # Связываем своё сообщение с id в ВК — для нативных reply собеседника.
+                await db.save_message_link(m.message_id, vk_user_id, mid)
             count += 1
             await asyncio.sleep(SEND_DELAY)
 
-        _queues[message.from_user.id] = []
-        _track_read(vk_user_id, last_mid, name)
-        await message.answer(f"✅ Отправлено {count} {_plural(count)} → {html.quote(name)}")
+        _queues[uid] = []
+        _status_msgs.pop(uid, None)
+        safe_name = html.quote(name)
+        conf = await message.answer(
+            f"✅ Отправлено {count} {_plural(count)} → {safe_name}", **SILENT
+        )
+        if read_watcher and last_mid:
+            async def _on_read() -> None:
+                try:
+                    await bot.edit_message_text(
+                        f"👁 Прочитано {count} {_plural(count)} → {safe_name}",
+                        chat_id=conf.chat.id, message_id=conf.message_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Не удалось отредактировать подтверждение пакета")
+            read_watcher.track(vk_user_id, last_mid, _on_read)
 
     @router.message(BridgeStates.ComposingMessages, F.text == BTN_CLEAR)
     async def btn_clear(message: Message, state: FSMContext) -> None:
         _queues[message.from_user.id] = []
-        await message.answer("🗑 Очередь очищена.")
+        _status_msgs.pop(message.from_user.id, None)
+        await message.answer("🗑 Очередь очищена.", **SILENT)
 
     @router.message(BridgeStates.ComposingMessages, F.text == BTN_SHOW)
     async def btn_show(message: Message, state: FSMContext) -> None:
         queue = _queues.get(message.from_user.id, [])
         if not queue:
-            await message.answer("Очередь пуста.")
+            await message.answer("Очередь пуста.", **SILENT)
             return
         lines = [f"{i}. {html.quote(_describe(m))}" for i, m in enumerate(queue, 1)]
-        await message.answer("👁 В очереди:\n" + "\n".join(lines))
+        await message.answer("👁 В очереди:\n" + "\n".join(lines), **SILENT)
 
     @router.message(BridgeStates.ComposingMessages, F.text == BTN_END)
     async def btn_end(message: Message, state: FSMContext) -> None:
         data = await state.get_data()
         name = html.quote(data.get("vk_user_name", "собеседником"))
         _queues.pop(message.from_user.id, None)
+        _status_msgs.pop(message.from_user.id, None)
         await state.clear()
         await message.answer(
             f"🔚 Диалог с {name} завершён. Сообщения больше никому не уходят — "
             "выбери собеседника через /write, когда понадобится.",
             reply_markup=ReplyKeyboardRemove(),
+            **SILENT,
         )
 
     # --- накопление сообщений ---------------------------------------------
 
     @router.message(BridgeStates.ComposingMessages)
-    async def on_compose(message: Message, state: FSMContext) -> None:
-        queue = _queues.setdefault(message.from_user.id, [])
+    async def on_compose(message: Message, state: FSMContext, bot: Bot) -> None:
+        uid = message.from_user.id
+        queue = _queues.setdefault(uid, [])
         queue.append(message)
         # Пока копишь — собеседник в ВК видит «печатает…».
         data = await state.get_data()
         if data.get("vk_user_id"):
             await gw.set_typing(data["vk_user_id"])
-        # Клавиатура уже висит снизу — под каждым сообщением её не повторяем.
-        await message.answer(f"➕ Добавлено ({len(queue)} в очереди)")
+        # Один счётчик-сообщение, которое редактируем, вместо «Добавлено» на каждое.
+        text = f"➕ В очереди: {len(queue)}"
+        status_id = _status_msgs.get(uid)
+        if status_id:
+            try:
+                await bot.edit_message_text(text, chat_id=uid, message_id=status_id)
+                return
+            except Exception:  # noqa: BLE001
+                _status_msgs.pop(uid, None)  # старое сообщение недоступно — пошлём новое
+        sent = await message.answer(text, **SILENT)
+        _status_msgs[uid] = sent.message_id
 
     # --- подсказка вне состояний ------------------------------------------
 
